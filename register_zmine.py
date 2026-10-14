@@ -53,31 +53,22 @@ def human_type(page, selector, text):
         time.sleep(random.uniform(0.05, 0.18))
 
 def discover_models(client):
-    """Query Groq API. Filter out non-chat models. Sort by quality (best first)."""
     try:
         resp = client.models.list()
         all_models = [m.id for m in resp.data]
-
         skip_keywords = [
             "whisper", "tts", "guard", "embed", "orpheus", "canopylabs",
             "playai", "synthesize", "audio", "speech", "voice",
             "safeguard", "prompt-guard"
         ]
         chat_models = [m for m in all_models if not any(k in m.lower() for k in skip_keywords)]
-
-        priority = [
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "qwen/qwen3.8-27b",
-            "allam-2-7b",
-        ]
+        priority = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "allam-2-7b"]
         def rank(m):
             for i, p in enumerate(priority):
                 if p in m:
                     return i
             return 999
         chat_models.sort(key=rank)
-
         log("llm", f"📋 Available chat models (sorted): {chat_models}")
         return chat_models
     except Exception as e:
@@ -85,15 +76,14 @@ def discover_models(client):
         return ["qwen/qwen3.8-27b", "allam-2-7b"]
 
 def ask_llm(client, models, question, options):
-    """Try each available chat model. Uses high max_tokens for reasoning models."""
-    prompt = f"""Answer this quiz question. Reply with ONLY the number (1, 2, 3, or 4) of the correct option.
-
-Question: {question}
+    """Chain-of-thought prompt. Extract bracketed answer first, fallback to digit scan."""
+    prompt = f"""Question: {question}
 
 Options:
 {chr(10).join(f'{i+1}. {opt}' for i, opt in enumerate(options))}
 
-Answer number:"""
+First, think step-by-step to calculate or determine the correct answer.
+Then, provide your final answer by writing ONLY the correct option number inside brackets at the very end, like [1], [2], [3], or [4]."""
 
     for model in models:
         try:
@@ -101,24 +91,28 @@ Answer number:"""
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=2000,  # Enough for reasoning models
+                max_tokens=1000,
             )
             raw = r.choices[0].message.content.strip()
-            log("llm", f"   {model} raw: {raw[:100]}")
-            m = re.search(r"\d+", raw)
-            if m:
-                # Prefer single-digit numbers near the end
-                matches = re.findall(r"\d+", raw)
-                # Check every number
-                for candidate in reversed(matches):
-                    n = int(candidate)
-                    if 1 <= n <= len(options):
-                        log("llm", f"✅ {model} → option {n}")
-                        return n
+            log("llm", f"   {model} reasoning end: {raw[-100:]}")
+
+            # Extract bracketed answer first
+            matches = re.findall(r"\[([1-4])\]", raw)
+            if matches:
+                n = int(matches[-1])
+                log("llm", f"✅ {model} → option {n}")
+                return n
+
+            # Fallback to standard digit search
+            matches = re.findall(r"\d+", raw)
+            for candidate in reversed(matches):
+                n = int(candidate)
+                if 1 <= n <= len(options):
+                    log("llm", f"✅ {model} → fallback option {n}")
+                    return n
         except Exception as e:
             log("llm", f"⚠️ {model} failed: {str(e)[:150]}")
             continue
-
     log("llm", "❌ All models failed, defaulting to option 1")
     return 1
 
@@ -134,10 +128,11 @@ def detect_done(page):
     return False
 
 def is_question_text(text):
-    """Return True if text looks like a quiz question."""
-    if not text or len(text) < 20:
+    """Fortified question filter using re.search for LEFT TODAY."""
+    if not text or len(text) < 10:
         return False
-    if re.fullmatch(r"\d+\s+LEFT\s+TODAY", text.upper().strip()):
+    # Use re.search instead of fullmatch to catch hidden whitespace
+    if re.search(r"\d+\s*LEFT\s*TODAY", text.upper()):
         return False
     if re.fullmatch(r"\d+", text.strip()):
         return False
@@ -152,44 +147,52 @@ def is_question_text(text):
                     "expires in", "not linked", "left today"]
     if any(b in low for b in bad_contains):
         return False
+    if re.fullmatch(r"[\d\s,\.%]+", text):
+        return False
     return True
 
 def parse_question(page):
-    """Extract quiz question + options. Filters aggressively."""
+    """Extract question + options. Falls back to text-line parsing if buttons fail."""
     try:
         body = page.inner_text("body")
-
         if "X TASKS" in body:
             body = body.split("X TASKS")[0]
 
         question = None
+        q_idx = -1
         lines = [l.strip() for l in body.split("\n") if l.strip()]
 
-        # Strategy 1: line after DIFFICULTY marker
+        # Strategy 1: line after DIFFICULTY (scan next 5 lines)
         for i, line in enumerate(lines):
-            if "DIFFICULTY" in line and i + 1 < len(lines):
-                candidate = lines[i + 1].strip()
-                if is_question_text(candidate):
-                    question = candidate
+            if "DIFFICULTY" in line.upper():
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    candidate = lines[j].strip()
+                    if is_question_text(candidate):
+                        question = candidate
+                        q_idx = j
+                        break
+                if question:
                     break
 
         # Strategy 2: substantial line ending with ? or .
         if not question:
-            for line in lines:
-                if len(line) > 25 and (line.endswith("?") or line.endswith(".")):
+            for i, line in enumerate(lines):
+                if len(line) > 12 and (line.endswith("?") or line.endswith(".")):
                     if is_question_text(line):
                         question = line
+                        q_idx = i
                         break
 
-        # Strategy 3: keyword-based
+        # Strategy 3: keyword-based detection
         if not question:
-            for line in lines:
+            for i, line in enumerate(lines):
                 low = line.lower()
                 if any(kw in low for kw in ["how many", "what is", "which of",
                                              "an assistant claims", "calculate",
                                              "is it true", "true or false"]):
-                    if is_question_text(line):
+                    if is_question_text(line) and len(line) > 10:
                         question = line
+                        q_idx = i
                         break
 
         if not question:
@@ -205,12 +208,10 @@ def parse_question(page):
         for btn in page.locator('button').all():
             try:
                 txt = btn.inner_text().strip()
-                if not txt or len(txt) < 2:
+                if not txt or len(txt) < 1:
                     continue
                 low = txt.lower()
                 if any(k in low for k in skip):
-                    continue
-                if re.fullmatch(r"\d+", txt):
                     continue
                 if len(txt) > 250:
                     continue
@@ -224,6 +225,19 @@ def parse_question(page):
             if o not in seen:
                 seen.add(o)
                 unique.append(o)
+
+        # NEW FALLBACK: Scrape options from text lines if buttons failed
+        if len(unique) < 2 and q_idx != -1:
+            extracted = []
+            for k in range(q_idx + 1, min(q_idx + 15, len(lines))):
+                if lines[k] in ["1", "2", "3", "4"]:
+                    if k + 1 < len(lines):
+                        nxt = lines[k + 1]
+                        if nxt not in ["1", "2", "3", "4"] and len(nxt) < 100:
+                            extracted.append(nxt)
+            if len(extracted) >= 2:
+                unique = extracted
+
         if len(unique) > 4:
             unique = unique[:4]
         if len(unique) < 2:
@@ -259,10 +273,18 @@ def answer_question(page, llm_client, models, question, options):
         except Exception:
             continue
     if not clicked:
+        # Try clicking by text
+        try:
+            page.click(f'text="{target}"', timeout=3000)
+            log("quiz", "✅ Clicked via text selector")
+            clicked = True
+        except Exception:
+            pass
+    if not clicked:
         page.keyboard.press(str(num))
         log("quiz", f"⚠️ Pressed key '{num}'")
 
-    random_sleep(2.0, 3.5)
+    random_sleep(3.0, 4.5)
 
     for _ in range(15):
         nb = get_next_button(page)
@@ -270,7 +292,7 @@ def answer_question(page, llm_client, models, question, options):
             try:
                 nb.click()
                 log("quiz", "✅ Clicked Next")
-                random_sleep(2.5, 4.0)
+                random_sleep(3.5, 5.0)
                 return True
             except Exception:
                 pass
@@ -281,46 +303,39 @@ def answer_question(page, llm_client, models, question, options):
 def run_quiz(page, llm_client, models):
     answered = 0
     consecutive_fails = 0
-
     for i in range(MAX_QUESTIONS):
         log("quiz", f"--- Question {i+1}/{MAX_QUESTIONS} ---")
         if detect_done(page):
             log("quiz", "✅ 'Done for today' detected — stopping")
             break
 
-        # Try parsing up to 3 times with waits
         question, options = None, None
-        for attempt in range(3):
+        for attempt in range(4):
             question, options = parse_question(page)
             if question:
                 break
-            log("quiz", f"⚠️ Parse attempt {attempt+1}/3 failed, waiting...")
-            random_sleep(2.5, 4.0)
+            log("quiz", f"⚠️ Parse attempt {attempt+1}/4 failed, waiting...")
+            random_sleep(3.0, 4.5)
 
         if not question:
-            log("quiz", "❌ Could not detect question after 3 attempts")
-            # Try to grab the body text for debugging
+            log("quiz", "❌ Could not detect question after 4 attempts")
             try:
                 body = page.inner_text("body")
                 log("quiz", f"Body dump: {body[:400]}")
             except Exception:
                 pass
-
             consecutive_fails += 1
             if consecutive_fails >= 2:
                 log("quiz", "❌ Too many consecutive failures, stopping")
                 break
-
-            # Try clicking Next to skip
             next_btn = get_next_button(page)
             if next_btn:
                 try:
                     next_btn.click()
-                    random_sleep(3.0, 5.0)
+                    random_sleep(3.5, 5.0)
                     continue
                 except Exception:
                     pass
-
             page.reload(wait_until="domcontentloaded")
             random_sleep(4.0, 6.0)
             continue
@@ -329,7 +344,7 @@ def run_quiz(page, llm_client, models):
         log("quiz", f"Q: {question[:120]}")
         answer_question(page, llm_client, models, question, options)
         answered += 1
-        random_sleep(1.5, 3.0)
+        random_sleep(2.0, 3.5)
         if detect_done(page):
             log("quiz", "✅ All questions completed")
             break
