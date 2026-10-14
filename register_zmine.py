@@ -82,10 +82,10 @@ def discover_models(client):
         return chat_models
     except Exception as e:
         log("llm", f"⚠️ Model discovery failed: {str(e)[:120]}")
-        return ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "allam-2-7b"]
+        return ["qwen/qwen3.8-27b", "allam-2-7b"]
 
 def ask_llm(client, models, question, options):
-    """Try each available chat model until one answers."""
+    """Try each available chat model. Uses high max_tokens for reasoning models."""
     prompt = f"""Answer this quiz question. Reply with ONLY the number (1, 2, 3, or 4) of the correct option.
 
 Question: {question}
@@ -101,18 +101,22 @@ Answer number:"""
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=10,
+                max_tokens=2000,  # Enough for reasoning models
             )
             raw = r.choices[0].message.content.strip()
+            log("llm", f"   {model} raw: {raw[:100]}")
             m = re.search(r"\d+", raw)
             if m:
-                n = int(m.group(0))
-                if 1 <= n <= len(options):
-                    log("llm", f"✅ {model} → option {n}")
-                    return n
+                # Prefer single-digit numbers near the end
+                matches = re.findall(r"\d+", raw)
+                # Check every number
+                for candidate in reversed(matches):
+                    n = int(candidate)
+                    if 1 <= n <= len(options):
+                        log("llm", f"✅ {model} → option {n}")
+                        return n
         except Exception as e:
-            err = str(e)[:100]
-            log("llm", f"⚠️ {model} failed: {err}")
+            log("llm", f"⚠️ {model} failed: {str(e)[:150]}")
             continue
 
     log("llm", "❌ All models failed, defaulting to option 1")
@@ -129,12 +133,32 @@ def detect_done(page):
         pass
     return False
 
+def is_question_text(text):
+    """Return True if text looks like a quiz question."""
+    if not text or len(text) < 20:
+        return False
+    if re.fullmatch(r"\d+\s+LEFT\s+TODAY", text.upper().strip()):
+        return False
+    if re.fullmatch(r"\d+", text.strip()):
+        return False
+    if text.upper().strip() in ["TASKS", "TASK", "DIFFICULTY", "VERIFY", "CHOOSE"]:
+        return False
+    low = text.lower()
+    bad_starts = ["left today", "tasks", "running", "per answer", "accuracy",
+                  "next expiry", "verify", "choose", "difficulty"]
+    if any(low.startswith(b) for b in bad_starts):
+        return False
+    bad_contains = ["x account", "handle", "post this", "tweet", "x tasks",
+                    "expires in", "not linked", "left today"]
+    if any(b in low for b in bad_contains):
+        return False
+    return True
+
 def parse_question(page):
-    """Extract quiz question + options. Ignores X Tasks + UI counters."""
+    """Extract quiz question + options. Filters aggressively."""
     try:
         body = page.inner_text("body")
 
-        # Strip X TASKS section
         if "X TASKS" in body:
             body = body.split("X TASKS")[0]
 
@@ -145,26 +169,26 @@ def parse_question(page):
         for i, line in enumerate(lines):
             if "DIFFICULTY" in line and i + 1 < len(lines):
                 candidate = lines[i + 1].strip()
-                if len(candidate) > 10:
+                if is_question_text(candidate):
                     question = candidate
                     break
 
         # Strategy 2: substantial line ending with ? or .
-        if not question or len(question) < 15:
+        if not question:
             for line in lines:
                 if len(line) > 25 and (line.endswith("?") or line.endswith(".")):
-                    if any(bad in line.lower() for bad in ["x account", "handle", "post this", "tweet", "x tasks"]):
-                        continue
-                    question = line
-                    break
+                    if is_question_text(line):
+                        question = line
+                        break
 
-        # Strategy 3: keyword-based detection
+        # Strategy 3: keyword-based
         if not question:
             for line in lines:
                 low = line.lower()
-                if any(kw in low for kw in ["how many", "what is", "which of", "an assistant claims",
-                                             "calculate", "is it true", "true or false"]):
-                    if len(line) > 15:
+                if any(kw in low for kw in ["how many", "what is", "which of",
+                                             "an assistant claims", "calculate",
+                                             "is it true", "true or false"]):
+                    if is_question_text(line):
                         question = line
                         break
 
@@ -246,7 +270,7 @@ def answer_question(page, llm_client, models, question, options):
             try:
                 nb.click()
                 log("quiz", "✅ Clicked Next")
-                random_sleep(2.0, 3.5)
+                random_sleep(2.5, 4.0)
                 return True
             except Exception:
                 pass
@@ -256,15 +280,38 @@ def answer_question(page, llm_client, models, question, options):
 
 def run_quiz(page, llm_client, models):
     answered = 0
+    consecutive_fails = 0
+
     for i in range(MAX_QUESTIONS):
         log("quiz", f"--- Question {i+1}/{MAX_QUESTIONS} ---")
         if detect_done(page):
             log("quiz", "✅ 'Done for today' detected — stopping")
             break
 
-        question, options = parse_question(page)
+        # Try parsing up to 3 times with waits
+        question, options = None, None
+        for attempt in range(3):
+            question, options = parse_question(page)
+            if question:
+                break
+            log("quiz", f"⚠️ Parse attempt {attempt+1}/3 failed, waiting...")
+            random_sleep(2.5, 4.0)
+
         if not question:
-            log("quiz", "⚠️ Could not detect question — attempting to skip...")
+            log("quiz", "❌ Could not detect question after 3 attempts")
+            # Try to grab the body text for debugging
+            try:
+                body = page.inner_text("body")
+                log("quiz", f"Body dump: {body[:400]}")
+            except Exception:
+                pass
+
+            consecutive_fails += 1
+            if consecutive_fails >= 2:
+                log("quiz", "❌ Too many consecutive failures, stopping")
+                break
+
+            # Try clicking Next to skip
             next_btn = get_next_button(page)
             if next_btn:
                 try:
@@ -273,15 +320,12 @@ def run_quiz(page, llm_client, models):
                     continue
                 except Exception:
                     pass
-            page.reload(wait_until="domcontentloaded")
-            random_sleep(3.0, 5.0)
-            if detect_done(page):
-                break
-            question, options = parse_question(page)
-            if not question:
-                log("quiz", "❌ Giving up on this account")
-                break
 
+            page.reload(wait_until="domcontentloaded")
+            random_sleep(4.0, 6.0)
+            continue
+
+        consecutive_fails = 0
         log("quiz", f"Q: {question[:120]}")
         answer_question(page, llm_client, models, question, options)
         answered += 1
