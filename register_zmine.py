@@ -18,13 +18,6 @@ ACCOUNTS_FILE = "zmine_accounts.jsonl"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_QUESTIONS = 12
 
-# Fallback list (used only if dynamic discovery fails)
-DEFAULT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-]
-
 FIRST_NAMES = [
     "James", "Mary", "John", "Patricia", "Robert", "Jennifer", "Michael", "Linda",
     "William", "Elizabeth", "David", "Barbara", "Richard", "Susan", "Joseph", "Jessica",
@@ -60,27 +53,39 @@ def human_type(page, selector, text):
         time.sleep(random.uniform(0.05, 0.18))
 
 def discover_models(client):
-    """Query Groq API to find which models the API key can access."""
+    """Query Groq API. Filter out non-chat models. Sort by quality (best first)."""
     try:
         resp = client.models.list()
-        models = []
-        for m in resp.data:
-            mid = m.id
-            low = mid.lower()
-            # Skip non-chat models (whisper, TTS, embeddings, guardrails)
-            if any(skip in low for skip in ["whisper", "tts", "guard", "embed"]):
-                continue
-            models.append(mid)
-        if models:
-            log("llm", f"📋 Discovered {len(models)} models: {models[:8]}")
-            return models
+        all_models = [m.id for m in resp.data]
+
+        skip_keywords = [
+            "whisper", "tts", "guard", "embed", "orpheus", "canopylabs",
+            "playai", "synthesize", "audio", "speech", "voice",
+            "safeguard", "prompt-guard"
+        ]
+        chat_models = [m for m in all_models if not any(k in m.lower() for k in skip_keywords)]
+
+        priority = [
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3.8-27b",
+            "allam-2-7b",
+        ]
+        def rank(m):
+            for i, p in enumerate(priority):
+                if p in m:
+                    return i
+            return 999
+        chat_models.sort(key=rank)
+
+        log("llm", f"📋 Available chat models (sorted): {chat_models}")
+        return chat_models
     except Exception as e:
         log("llm", f"⚠️ Model discovery failed: {str(e)[:120]}")
-    log("llm", "⚠️ Using fallback model list")
-    return DEFAULT_MODELS
+        return ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "allam-2-7b"]
 
 def ask_llm(client, models, question, options):
-    """Try each available model until one answers."""
+    """Try each available chat model until one answers."""
     prompt = f"""Answer this quiz question. Reply with ONLY the number (1, 2, 3, or 4) of the correct option.
 
 Question: {question}
@@ -110,7 +115,7 @@ Answer number:"""
             log("llm", f"⚠️ {model} failed: {err}")
             continue
 
-    log("llm", "❌ All models failed")
+    log("llm", "❌ All models failed, defaulting to option 1")
     return 1
 
 def detect_done(page):
@@ -125,30 +130,18 @@ def detect_done(page):
     return False
 
 def parse_question(page):
-    """Extract quiz question + options. Ignores X Tasks section and UI noise."""
+    """Extract quiz question + options. Ignores X Tasks + UI counters."""
     try:
         body = page.inner_text("body")
 
-        # --- Strip X TASKS section ---
+        # Strip X TASKS section
         if "X TASKS" in body:
             body = body.split("X TASKS")[0]
 
         question = None
         lines = [l.strip() for l in body.split("\n") if l.strip()]
 
-        # Filter out obvious UI noise lines
-        noise_keywords = [
-            "LEFT TODAY", "TASKS", "DIFFICULTY", "VERIFY", "CHOOSE",
-            "PER ANSWER", "RUNNING", "NEXT EXPIRY", "ACCURACY",
-            "X TASKS", "not linked", "expires in"
-        ]
-        clean_lines = []
-        for line in lines:
-            if any(noise in line.upper() for noise in noise_keywords):
-                continue
-            clean_lines.append(line)
-
-        # Strategy 1: Find line after a "DIFFICULTY" marker
+        # Strategy 1: line after DIFFICULTY marker
         for i, line in enumerate(lines):
             if "DIFFICULTY" in line and i + 1 < len(lines):
                 candidate = lines[i + 1].strip()
@@ -156,30 +149,28 @@ def parse_question(page):
                     question = candidate
                     break
 
-        # Strategy 2: Substantial line ending with ? or .
+        # Strategy 2: substantial line ending with ? or .
         if not question or len(question) < 15:
-            for line in clean_lines:
+            for line in lines:
                 if len(line) > 25 and (line.endswith("?") or line.endswith(".")):
-                    if any(bad in line.lower() for bad in ["x account", "handle", "post this", "tweet"]):
+                    if any(bad in line.lower() for bad in ["x account", "handle", "post this", "tweet", "x tasks"]):
                         continue
                     question = line
                     break
 
-        # Strategy 3: Any line containing obvious question patterns
+        # Strategy 3: keyword-based detection
         if not question:
-            for line in clean_lines:
+            for line in lines:
                 low = line.lower()
-                if any(kw in low for kw in ["how many", "what is", "which of", "an assistant claims", "calculate", "is it true", "true or false"]):
+                if any(kw in low for kw in ["how many", "what is", "which of", "an assistant claims",
+                                             "calculate", "is it true", "true or false"]):
                     if len(line) > 15:
                         question = line
                         break
 
         if not question:
-            log("parse", "⚠️ Could not extract question text")
-            log("parse", f"Body dump: {body[:500]}")
             return None, None
 
-        # --- Extract answer options ---
         skip = ["start mining", "boost", "sign in", "log in", "copy", "post it",
                 "verify my handle", "get a new code", "cancel", "start", "next",
                 "confirm", "close", "rig", "boosts", "si", "wallet",
@@ -211,14 +202,11 @@ def parse_question(page):
                 unique.append(o)
         if len(unique) > 4:
             unique = unique[:4]
-
         if len(unique) < 2:
-            log("parse", "⚠️ Not enough options found")
             return None, None
-
         return question, unique
     except Exception as e:
-        log("parse", f"⚠️ Exception: {e}")
+        log("parse", f"⚠️ {e}")
         return None, None
 
 def get_next_button(page):
@@ -275,8 +263,6 @@ def run_quiz(page, llm_client, models):
             break
 
         question, options = parse_question(page)
-        
-        # If parse fails, try to skip by clicking Next or waiting
         if not question:
             log("quiz", "⚠️ Could not detect question — attempting to skip...")
             next_btn = get_next_button(page)
@@ -287,7 +273,6 @@ def run_quiz(page, llm_client, models):
                     continue
                 except Exception:
                     pass
-            # If no next button, reload page and retry
             page.reload(wait_until="domcontentloaded")
             random_sleep(3.0, 5.0)
             if detect_done(page):
