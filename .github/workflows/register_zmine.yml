@@ -23,9 +23,9 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Playwright & Chromium
+      - name: Install Playwright & Dependencies
         run: |
-          pip install playwright
+          pip install playwright groq
           playwright install chromium --with-deps
 
       - name: Ensure accounts file exists
@@ -34,13 +34,15 @@ jobs:
             touch zmine_accounts.jsonl
             echo "Created empty zmine_accounts.jsonl"
           else
-            echo "zmine_accounts.jsonl exists with $(wc -l < zmine_accounts.jsonl) entries"
+            echo "zmine_accounts.jsonl has $(wc -l < zmine_accounts.jsonl) entries"
           fi
 
-      - name: Run Registration
+      - name: Run Full Flow
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python register_zmine.py
 
-      - name: Commit New Account to GitHub
+      - name: Commit New Account
         run: |
           git config --global user.name "ZMine Bot"
           git config --global user.email "bot@example.com"
