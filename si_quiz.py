@@ -6,11 +6,25 @@ import re
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from groq import Groq
 
+# ============================================================
+#   CONFIGURATION
+# ============================================================
 ACCOUNTS_FILE = "zmine_accounts.jsonl"
 SI_URL = "https://zmine.si/app/si"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_QUESTIONS = 12
 
+# Groq model fallback chain
+GROQ_MODELS = [
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+
+# ============================================================
+#   HELPERS
+# ============================================================
 def log(step, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{step}] {msg}", flush=True)
 
@@ -27,6 +41,7 @@ def load_accounts():
     return accounts
 
 def ask_llm(client, question, options):
+    """Try multiple Groq models in order. Returns 1-indexed option number."""
     prompt = f"""Answer this quiz question. Reply with ONLY the number (1, 2, 3, or 4) of the correct option.
 
 Question: {question}
@@ -35,23 +50,26 @@ Options:
 {chr(10).join(f'{i+1}. {opt}' for i, opt in enumerate(options))}
 
 Answer number:"""
-    try:
-        r = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=10,
-        )
-        raw = r.choices[0].message.content.strip()
-        m = re.search(r"\d+", raw)
-        if m:
-            n = int(m.group(0))
-            if 1 <= n <= len(options):
-                return n
-        return 1
-    except Exception as e:
-        log("llm", f"⚠️ {e}")
-        return 1
+    for model in GROQ_MODELS:
+        try:
+            r = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=10,
+            )
+            raw = r.choices[0].message.content.strip()
+            m = re.search(r"\d+", raw)
+            if m:
+                n = int(m.group(0))
+                if 1 <= n <= len(options):
+                    log("llm", f"✅ {model} chose {n}")
+                    return n
+        except Exception as e:
+            log("llm", f"⚠️ {model} failed: {str(e)[:80]}")
+            continue
+    log("llm", "❌ All models failed, defaulting to option 1")
+    return 1
 
 def sign_in(page, login_key):
     random_sleep(2.0, 3.0)
@@ -72,7 +90,7 @@ def sign_in(page, login_key):
             for btn in ["Sign in", "Log in", "Login", "Continue"]:
                 try:
                     page.click(f'button:has-text("{btn}")', timeout=2000)
-                    log("signin", f"✅ Signed in")
+                    log("signin", "✅ Signed in")
                     random_sleep(4.0, 6.0)
                     return True
                 except PWTimeout:
@@ -93,26 +111,39 @@ def detect_done(page):
     return False
 
 def parse_question(page):
+    """Extract quiz question + options. Ignores X Tasks section."""
     try:
         body = page.inner_text("body")
+
+        # --- Strip X TASKS section ---
+        if "X TASKS" in body:
+            body = body.split("X TASKS")[0]
+
         question = None
         lines = [l.strip() for l in body.split("\n") if l.strip()]
+
         for i, line in enumerate(lines):
             if "DIFFICULTY" in line and i + 1 < len(lines):
                 question = lines[i + 1]
                 break
+
         if not question or len(question) < 15:
             for line in lines:
                 if len(line) > 25 and (line.endswith("?") or line.endswith(".")):
+                    if any(bad in line.lower() for bad in ["x account", "handle", "post this", "tweet", "x tasks"]):
+                        continue
                     question = line
                     break
+
         if not question:
             return None, None
 
         skip = ["start mining", "boost", "sign in", "log in", "copy", "post it",
                 "verify my handle", "get a new code", "cancel", "start", "next",
                 "confirm", "close", "rig", "boosts", "si", "wallet",
-                "leaderboard", "earn hashpower", "advisor", "auto-pilot"]
+                "leaderboard", "earn hashpower", "advisor", "auto-pilot",
+                "x tasks", "x account", "handle", "tweet"]
+
         options = []
         for btn in page.locator('button').all():
             try:
@@ -164,26 +195,29 @@ def answer_question(page, llm_client, question, options):
         try:
             if btn.inner_text().strip() == target:
                 btn.click()
-                log("quiz", "✅ Clicked")
+                log("quiz", "✅ Clicked answer")
                 clicked = True
                 break
         except Exception:
             continue
     if not clicked:
         page.keyboard.press(str(num))
+        log("quiz", f"⚠️ Pressed key '{num}'")
 
     random_sleep(2.0, 3.5)
+
     for _ in range(15):
         nb = get_next_button(page)
         if nb:
             try:
                 nb.click()
-                log("quiz", "✅ Next")
+                log("quiz", "✅ Clicked Next")
                 random_sleep(2.0, 3.5)
                 return True
             except Exception:
                 pass
         time.sleep(1)
+    log("quiz", "⚠️ No Next button found")
     return False
 
 def run_quiz(page, llm_client):
@@ -202,6 +236,7 @@ def run_quiz(page, llm_client):
         random_sleep(1.5, 3.0)
         if detect_done(page):
             break
+    log("quiz", f"✅ Finished: {answered} questions")
     return answered
 
 def run_for_account(llm_client, account):
