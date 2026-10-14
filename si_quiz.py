@@ -6,17 +6,11 @@ import re
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from groq import Groq
 
-# ============================================================
-#   CONFIGURATION
-# ============================================================
 ACCOUNTS_FILE = "zmine_accounts.jsonl"
 SI_URL = "https://zmine.si/app/si"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_QUESTIONS = 12
 
-# ============================================================
-#   HELPERS
-# ============================================================
 def log(step, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{step}] {msg}", flush=True)
 
@@ -56,29 +50,37 @@ def discover_models(client):
         return ["qwen/qwen3.8-27b", "allam-2-7b"]
 
 def ask_llm(client, models, question, options):
-    prompt = f"""Answer this quiz question. Reply with ONLY the number (1, 2, 3, or 4) of the correct option.
-
-Question: {question}
+    """Chain-of-thought prompt. Extract bracketed answer first."""
+    prompt = f"""Question: {question}
 
 Options:
 {chr(10).join(f'{i+1}. {opt}' for i, opt in enumerate(options))}
 
-Answer number:"""
+First, think step-by-step to calculate or determine the correct answer.
+Then, provide your final answer by writing ONLY the correct option number inside brackets at the very end, like [1], [2], [3], or [4]."""
+
     for model in models:
         try:
             r = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
-                max_tokens=2000,
+                max_tokens=1000,
             )
             raw = r.choices[0].message.content.strip()
-            log("llm", f"   {model} raw: {raw[:100]}")
+            log("llm", f"   {model} reasoning end: {raw[-100:]}")
+
+            matches = re.findall(r"\[([1-4])\]", raw)
+            if matches:
+                n = int(matches[-1])
+                log("llm", f"✅ {model} → option {n}")
+                return n
+
             matches = re.findall(r"\d+", raw)
             for candidate in reversed(matches):
                 n = int(candidate)
                 if 1 <= n <= len(options):
-                    log("llm", f"✅ {model} → option {n}")
+                    log("llm", f"✅ {model} → fallback option {n}")
                     return n
         except Exception as e:
             log("llm", f"⚠️ {model} failed: {str(e)[:150]}")
@@ -125,9 +127,9 @@ def detect_done(page):
     return False
 
 def is_question_text(text):
-    if not text or len(text) < 20:
+    if not text or len(text) < 10:
         return False
-    if re.fullmatch(r"\d+\s+LEFT\s+TODAY", text.upper().strip()):
+    if re.search(r"\d+\s*LEFT\s*TODAY", text.upper()):
         return False
     if re.fullmatch(r"\d+", text.strip()):
         return False
@@ -142,6 +144,8 @@ def is_question_text(text):
                     "expires in", "not linked", "left today"]
     if any(b in low for b in bad_contains):
         return False
+    if re.fullmatch(r"[\d\s,\.%]+", text):
+        return False
     return True
 
 def parse_question(page):
@@ -151,30 +155,37 @@ def parse_question(page):
             body = body.split("X TASKS")[0]
 
         question = None
+        q_idx = -1
         lines = [l.strip() for l in body.split("\n") if l.strip()]
 
         for i, line in enumerate(lines):
-            if "DIFFICULTY" in line and i + 1 < len(lines):
-                candidate = lines[i + 1].strip()
-                if is_question_text(candidate):
-                    question = candidate
+            if "DIFFICULTY" in line.upper():
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    candidate = lines[j].strip()
+                    if is_question_text(candidate):
+                        question = candidate
+                        q_idx = j
+                        break
+                if question:
                     break
 
         if not question:
-            for line in lines:
-                if len(line) > 25 and (line.endswith("?") or line.endswith(".")):
+            for i, line in enumerate(lines):
+                if len(line) > 12 and (line.endswith("?") or line.endswith(".")):
                     if is_question_text(line):
                         question = line
+                        q_idx = i
                         break
 
         if not question:
-            for line in lines:
+            for i, line in enumerate(lines):
                 low = line.lower()
                 if any(kw in low for kw in ["how many", "what is", "which of",
                                              "an assistant claims", "calculate",
                                              "is it true", "true or false"]):
-                    if is_question_text(line):
+                    if is_question_text(line) and len(line) > 10:
                         question = line
+                        q_idx = i
                         break
 
         if not question:
@@ -190,12 +201,10 @@ def parse_question(page):
         for btn in page.locator('button').all():
             try:
                 txt = btn.inner_text().strip()
-                if not txt or len(txt) < 2:
+                if not txt or len(txt) < 1:
                     continue
                 low = txt.lower()
                 if any(k in low for k in skip):
-                    continue
-                if re.fullmatch(r"\d+", txt):
                     continue
                 if len(txt) > 250:
                     continue
@@ -209,6 +218,19 @@ def parse_question(page):
             if o not in seen:
                 seen.add(o)
                 unique.append(o)
+
+        # Fallback: scrape options from text lines
+        if len(unique) < 2 and q_idx != -1:
+            extracted = []
+            for k in range(q_idx + 1, min(q_idx + 15, len(lines))):
+                if lines[k] in ["1", "2", "3", "4"]:
+                    if k + 1 < len(lines):
+                        nxt = lines[k + 1]
+                        if nxt not in ["1", "2", "3", "4"] and len(nxt) < 100:
+                            extracted.append(nxt)
+            if len(extracted) >= 2:
+                unique = extracted
+
         if len(unique) > 4:
             unique = unique[:4]
         if len(unique) < 2:
@@ -242,17 +264,24 @@ def answer_question(page, llm_client, models, question, options):
         except Exception:
             continue
     if not clicked:
+        try:
+            page.click(f'text="{target}"', timeout=3000)
+            log("quiz", "✅ Clicked via text selector")
+            clicked = True
+        except Exception:
+            pass
+    if not clicked:
         page.keyboard.press(str(num))
         log("quiz", f"⚠️ Pressed key '{num}'")
 
-    random_sleep(2.0, 3.5)
+    random_sleep(3.0, 4.5)
     for _ in range(15):
         nb = get_next_button(page)
         if nb:
             try:
                 nb.click()
                 log("quiz", "✅ Clicked Next")
-                random_sleep(2.5, 4.0)
+                random_sleep(3.5, 5.0)
                 return True
             except Exception:
                 pass
@@ -269,15 +298,15 @@ def run_quiz(page, llm_client, models):
             break
 
         question, options = None, None
-        for attempt in range(3):
+        for attempt in range(4):
             question, options = parse_question(page)
             if question:
                 break
-            log("quiz", f"⚠️ Parse attempt {attempt+1}/3 failed, waiting...")
-            random_sleep(2.5, 4.0)
+            log("quiz", f"⚠️ Parse attempt {attempt+1}/4 failed, waiting...")
+            random_sleep(3.0, 4.5)
 
         if not question:
-            log("quiz", "❌ Could not detect question after 3 attempts")
+            log("quiz", "❌ Could not detect question after 4 attempts")
             try:
                 body = page.inner_text("body")
                 log("quiz", f"Body dump: {body[:400]}")
@@ -291,7 +320,7 @@ def run_quiz(page, llm_client, models):
             if nb:
                 try:
                     nb.click()
-                    random_sleep(3.0, 5.0)
+                    random_sleep(3.5, 5.0)
                     continue
                 except Exception:
                     pass
@@ -303,7 +332,7 @@ def run_quiz(page, llm_client, models):
         log("quiz", f"Q: {question[:120]}")
         answer_question(page, llm_client, models, question, options)
         answered += 1
-        random_sleep(1.5, 3.0)
+        random_sleep(2.0, 3.5)
         if detect_done(page):
             break
     log("quiz", f"✅ Finished: {answered} questions")
