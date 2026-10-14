@@ -14,14 +14,6 @@ SI_URL = "https://zmine.si/app/si"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_QUESTIONS = 12
 
-# Groq model fallback chain
-GROQ_MODELS = [
-    "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
-]
-
 # ============================================================
 #   HELPERS
 # ============================================================
@@ -40,8 +32,39 @@ def load_accounts():
                 accounts.append(json.loads(line))
     return accounts
 
-def ask_llm(client, question, options):
-    """Try multiple Groq models in order. Returns 1-indexed option number."""
+def discover_models(client):
+    """Query Groq API. Filter out non-chat models. Sort by quality (best first)."""
+    try:
+        resp = client.models.list()
+        all_models = [m.id for m in resp.data]
+
+        skip_keywords = [
+            "whisper", "tts", "guard", "embed", "orpheus", "canopylabs",
+            "playai", "synthesize", "audio", "speech", "voice",
+            "safeguard", "prompt-guard"
+        ]
+        chat_models = [m for m in all_models if not any(k in m.lower() for k in skip_keywords)]
+
+        priority = [
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3.8-27b",
+            "allam-2-7b",
+        ]
+        def rank(m):
+            for i, p in enumerate(priority):
+                if p in m:
+                    return i
+            return 999
+        chat_models.sort(key=rank)
+
+        log("llm", f"📋 Available chat models (sorted): {chat_models}")
+        return chat_models
+    except Exception as e:
+        log("llm", f"⚠️ Model discovery failed: {str(e)[:120]}")
+        return ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "allam-2-7b"]
+
+def ask_llm(client, models, question, options):
     prompt = f"""Answer this quiz question. Reply with ONLY the number (1, 2, 3, or 4) of the correct option.
 
 Question: {question}
@@ -50,7 +73,7 @@ Options:
 {chr(10).join(f'{i+1}. {opt}' for i, opt in enumerate(options))}
 
 Answer number:"""
-    for model in GROQ_MODELS:
+    for model in models:
         try:
             r = client.chat.completions.create(
                 model=model,
@@ -63,7 +86,7 @@ Answer number:"""
             if m:
                 n = int(m.group(0))
                 if 1 <= n <= len(options):
-                    log("llm", f"✅ {model} chose {n}")
+                    log("llm", f"✅ {model} → option {n}")
                     return n
         except Exception as e:
             log("llm", f"⚠️ {model} failed: {str(e)[:80]}")
@@ -111,11 +134,8 @@ def detect_done(page):
     return False
 
 def parse_question(page):
-    """Extract quiz question + options. Ignores X Tasks section."""
     try:
         body = page.inner_text("body")
-
-        # --- Strip X TASKS section ---
         if "X TASKS" in body:
             body = body.split("X TASKS")[0]
 
@@ -124,8 +144,10 @@ def parse_question(page):
 
         for i, line in enumerate(lines):
             if "DIFFICULTY" in line and i + 1 < len(lines):
-                question = lines[i + 1]
-                break
+                candidate = lines[i + 1].strip()
+                if len(candidate) > 10:
+                    question = candidate
+                    break
 
         if not question or len(question) < 15:
             for line in lines:
@@ -134,6 +156,15 @@ def parse_question(page):
                         continue
                     question = line
                     break
+
+        if not question:
+            for line in lines:
+                low = line.lower()
+                if any(kw in low for kw in ["how many", "what is", "which of", "an assistant claims",
+                                             "calculate", "is it true", "true or false"]):
+                    if len(line) > 15:
+                        question = line
+                        break
 
         if not question:
             return None, None
@@ -185,8 +216,8 @@ def get_next_button(page):
             continue
     return None
 
-def answer_question(page, llm_client, question, options):
-    num = ask_llm(llm_client, question, options)
+def answer_question(page, llm_client, models, question, options):
+    num = ask_llm(llm_client, models, question, options)
     log("quiz", f"LLM chose {num}: {options[num-1][:80]}")
 
     target = options[num - 1]
@@ -220,7 +251,7 @@ def answer_question(page, llm_client, question, options):
     log("quiz", "⚠️ No Next button found")
     return False
 
-def run_quiz(page, llm_client):
+def run_quiz(page, llm_client, models):
     answered = 0
     for i in range(MAX_QUESTIONS):
         if detect_done(page):
@@ -228,10 +259,24 @@ def run_quiz(page, llm_client):
             break
         q, opts = parse_question(page)
         if not q:
-            log("quiz", "⚠️ No question detected")
-            break
+            log("quiz", "⚠️ No question detected — trying to skip...")
+            nb = get_next_button(page)
+            if nb:
+                try:
+                    nb.click()
+                    random_sleep(3.0, 5.0)
+                    continue
+                except Exception:
+                    pass
+            page.reload(wait_until="domcontentloaded")
+            random_sleep(3.0, 5.0)
+            if detect_done(page):
+                break
+            q, opts = parse_question(page)
+            if not q:
+                break
         log("quiz", f"Q{i+1}: {q[:100]}")
-        answer_question(page, llm_client, q, opts)
+        answer_question(page, llm_client, models, q, opts)
         answered += 1
         random_sleep(1.5, 3.0)
         if detect_done(page):
@@ -239,7 +284,7 @@ def run_quiz(page, llm_client):
     log("quiz", f"✅ Finished: {answered} questions")
     return answered
 
-def run_for_account(llm_client, account):
+def run_for_account(llm_client, models, account):
     log("account", f"📚 {account['display_name']}")
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -264,9 +309,9 @@ def run_for_account(llm_client, account):
                 page.goto(SI_URL, wait_until="domcontentloaded", timeout=60000)
                 random_sleep(2.0, 4.0)
             if detect_done(page):
-                log("account", "Already done")
+                log("account", "Already done for today")
                 return 0
-            return run_quiz(page, llm_client)
+            return run_quiz(page, llm_client, models)
         except Exception as e:
             log("account", f"❌ {e}")
             return 0
@@ -278,12 +323,13 @@ def main():
         log("init", "❌ GROQ_API_KEY missing")
         return
     llm = Groq(api_key=GROQ_API_KEY)
+    models = discover_models(llm)
     accounts = load_accounts()
     random.shuffle(accounts)
     total = 0
     for idx, acc in enumerate(accounts, 1):
         log("main", f"=== {idx}/{len(accounts)}: {acc['display_name']} ===")
-        total += run_for_account(llm, acc)
+        total += run_for_account(llm, models, acc)
         random_sleep(10.0, 20.0)
     log("done", f"✅ Total answered: {total}")
 
