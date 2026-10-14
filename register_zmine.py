@@ -130,7 +130,41 @@ def run_registration():
         with open(ACCOUNTS_FILE, "a") as f:
             f.write(json.dumps(account) + "\n")
         log("6/6", f"💾 Saved account to {ACCOUNTS_FILE}")
+        # --- OPTIONAL: Start mining immediately after registration ---
+        log("6.5/6", "Navigating to app to start mining...")
+        try:
+            page.goto("https://zmine.si/app", wait_until="domcontentloaded", timeout=60000)
+            random_sleep(2.0, 4.0)
 
+            # Sign in with the new key
+            try:
+                page.fill('input[placeholder*="login" i], input[name="loginKey"]', login_key)
+                random_sleep(0.5, 1.5)
+                page.click('button:has-text("Sign in"), button:has-text("Log in")')
+                random_sleep(4.0, 6.0)
+            except Exception:
+                log("6.5/6", "Already signed in after registration")
+
+            # Click Start mining
+            try:
+                page.wait_for_selector('button:has-text("Start mining")', timeout=20000)
+                page.click('button:has-text("Start mining")')
+                random_sleep(2.0, 4.0)
+
+                # Confirm in modal
+                try:
+                    page.wait_for_selector('text=START MINING', timeout=10000)
+                    page.click('button:has-text("Start")', timeout=5000)
+                    log("6.5/6", "🟢 Mining started immediately!")
+                except Exception:
+                    log("6.5/6", "⚠️ Modal not found — mining may auto-start")
+
+                random_sleep(3.0, 5.0)
+            except Exception as e:
+                log("6.5/6", f"⚠️ Could not start mining: {e}")
+        except Exception as e:
+            log("6.5/6", f"⚠️ Post-registration mining step failed: {e}")
+            
         browser.close()
         log("done", f"✅ Registration complete for {display_name}")
         return True
