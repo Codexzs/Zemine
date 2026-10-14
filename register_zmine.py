@@ -23,8 +23,6 @@ DEFAULT_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "meta-llama/llama-4-scout-17b-16e-instruct",
-    "qwen/qwen3-32b",
-    "deepseek-r1-distill-llama-70b",
 ]
 
 FIRST_NAMES = [
@@ -69,7 +67,7 @@ def discover_models(client):
         for m in resp.data:
             mid = m.id
             low = mid.lower()
-            # Skip non-chat models
+            # Skip non-chat models (whisper, TTS, embeddings, guardrails)
             if any(skip in low for skip in ["whisper", "tts", "guard", "embed"]):
                 continue
             models.append(mid)
@@ -127,30 +125,61 @@ def detect_done(page):
     return False
 
 def parse_question(page):
+    """Extract quiz question + options. Ignores X Tasks section and UI noise."""
     try:
         body = page.inner_text("body")
+
+        # --- Strip X TASKS section ---
         if "X TASKS" in body:
             body = body.split("X TASKS")[0]
 
         question = None
         lines = [l.strip() for l in body.split("\n") if l.strip()]
 
+        # Filter out obvious UI noise lines
+        noise_keywords = [
+            "LEFT TODAY", "TASKS", "DIFFICULTY", "VERIFY", "CHOOSE",
+            "PER ANSWER", "RUNNING", "NEXT EXPIRY", "ACCURACY",
+            "X TASKS", "not linked", "expires in"
+        ]
+        clean_lines = []
+        for line in lines:
+            if any(noise in line.upper() for noise in noise_keywords):
+                continue
+            clean_lines.append(line)
+
+        # Strategy 1: Find line after a "DIFFICULTY" marker
         for i, line in enumerate(lines):
             if "DIFFICULTY" in line and i + 1 < len(lines):
-                question = lines[i + 1]
-                break
+                candidate = lines[i + 1].strip()
+                if len(candidate) > 10:
+                    question = candidate
+                    break
 
+        # Strategy 2: Substantial line ending with ? or .
         if not question or len(question) < 15:
-            for line in lines:
+            for line in clean_lines:
                 if len(line) > 25 and (line.endswith("?") or line.endswith(".")):
-                    if any(bad in line.lower() for bad in ["x account", "handle", "post this", "tweet", "x tasks"]):
+                    if any(bad in line.lower() for bad in ["x account", "handle", "post this", "tweet"]):
                         continue
                     question = line
                     break
 
+        # Strategy 3: Any line containing obvious question patterns
         if not question:
+            for line in clean_lines:
+                low = line.lower()
+                if any(kw in low for kw in ["how many", "what is", "which of", "an assistant claims", "calculate", "is it true", "true or false"]):
+                    if len(line) > 15:
+                        question = line
+                        break
+
+        if not question:
+            log("parse", "⚠️ Could not extract question text")
+            log("parse", f"Body dump: {body[:500]}")
             return None, None
 
+        # --- Extract answer options ---
         skip = ["start mining", "boost", "sign in", "log in", "copy", "post it",
                 "verify my handle", "get a new code", "cancel", "start", "next",
                 "confirm", "close", "rig", "boosts", "si", "wallet",
@@ -182,11 +211,14 @@ def parse_question(page):
                 unique.append(o)
         if len(unique) > 4:
             unique = unique[:4]
+
         if len(unique) < 2:
+            log("parse", "⚠️ Not enough options found")
             return None, None
+
         return question, unique
     except Exception as e:
-        log("parse", f"⚠️ {e}")
+        log("parse", f"⚠️ Exception: {e}")
         return None, None
 
 def get_next_button(page):
@@ -243,9 +275,27 @@ def run_quiz(page, llm_client, models):
             break
 
         question, options = parse_question(page)
+        
+        # If parse fails, try to skip by clicking Next or waiting
         if not question:
-            log("quiz", "⚠️ Could not detect question — stopping")
-            break
+            log("quiz", "⚠️ Could not detect question — attempting to skip...")
+            next_btn = get_next_button(page)
+            if next_btn:
+                try:
+                    next_btn.click()
+                    random_sleep(3.0, 5.0)
+                    continue
+                except Exception:
+                    pass
+            # If no next button, reload page and retry
+            page.reload(wait_until="domcontentloaded")
+            random_sleep(3.0, 5.0)
+            if detect_done(page):
+                break
+            question, options = parse_question(page)
+            if not question:
+                log("quiz", "❌ Giving up on this account")
+                break
 
         log("quiz", f"Q: {question[:120]}")
         answer_question(page, llm_client, models, question, options)
@@ -461,7 +511,6 @@ def run_full_flow(llm_client):
     display_name = generate_display_name()
     log("init", f"🚀 Full flow: {display_name}")
 
-    # Discover models BEFORE opening browser
     models = discover_models(llm_client)
     if not models:
         log("init", "⚠️ No LLM models available — will default to option 1")
