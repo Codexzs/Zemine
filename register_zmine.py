@@ -18,6 +18,14 @@ ACCOUNTS_FILE = "zmine_accounts.jsonl"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_QUESTIONS = 12
 
+# Groq model fallback chain (updated - llama-3.3-70b-versatile is deprecated)
+GROQ_MODELS = [
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+
 FIRST_NAMES = [
     "James", "Mary", "John", "Patricia", "Robert", "Jennifer", "Michael", "Linda",
     "William", "Elizabeth", "David", "Barbara", "Richard", "Susan", "Joseph", "Jessica",
@@ -34,6 +42,9 @@ LAST_NAMES = [
     "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson", "Walker", "Young",
 ]
 
+# ============================================================
+#   HELPERS
+# ============================================================
 def log(step, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{step}] {msg}", flush=True)
 
@@ -50,6 +61,7 @@ def human_type(page, selector, text):
         time.sleep(random.uniform(0.05, 0.18))
 
 def ask_llm(client, question, options):
+    """Try multiple Groq models in order. Returns 1-indexed option number."""
     prompt = f"""Answer this quiz question. Reply with ONLY the number (1, 2, 3, or 4) of the correct option.
 
 Question: {question}
@@ -58,23 +70,26 @@ Options:
 {chr(10).join(f'{i+1}. {opt}' for i, opt in enumerate(options))}
 
 Answer number:"""
-    try:
-        r = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=10,
-        )
-        raw = r.choices[0].message.content.strip()
-        m = re.search(r"\d+", raw)
-        if m:
-            n = int(m.group(0))
-            if 1 <= n <= len(options):
-                return n
-        return 1
-    except Exception as e:
-        log("llm", f"⚠️ LLM failed: {e}")
-        return 1
+    for model in GROQ_MODELS:
+        try:
+            r = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=10,
+            )
+            raw = r.choices[0].message.content.strip()
+            m = re.search(r"\d+", raw)
+            if m:
+                n = int(m.group(0))
+                if 1 <= n <= len(options):
+                    log("llm", f"✅ {model} chose {n}")
+                    return n
+        except Exception as e:
+            log("llm", f"⚠️ {model} failed: {str(e)[:80]}")
+            continue
+    log("llm", "❌ All models failed, defaulting to option 1")
+    return 1
 
 def detect_done(page):
     try:
@@ -88,26 +103,41 @@ def detect_done(page):
     return False
 
 def parse_question(page):
+    """Extract quiz question + options. Ignores X Tasks section."""
     try:
         body = page.inner_text("body")
+
+        # --- Strip X TASKS section ---
+        if "X TASKS" in body:
+            body = body.split("X TASKS")[0]
+
         question = None
         lines = [l.strip() for l in body.split("\n") if l.strip()]
+
+        # Strategy 1: line after DIFFICULTY marker
         for i, line in enumerate(lines):
             if "DIFFICULTY" in line and i + 1 < len(lines):
                 question = lines[i + 1]
                 break
+
+        # Strategy 2: substantial line ending with ? or .
         if not question or len(question) < 15:
             for line in lines:
                 if len(line) > 25 and (line.endswith("?") or line.endswith(".")):
+                    if any(bad in line.lower() for bad in ["x account", "handle", "post this", "tweet", "x tasks"]):
+                        continue
                     question = line
                     break
+
         if not question:
             return None, None
 
         skip = ["start mining", "boost", "sign in", "log in", "copy", "post it",
                 "verify my handle", "get a new code", "cancel", "start", "next",
                 "confirm", "close", "rig", "boosts", "si", "wallet",
-                "leaderboard", "earn hashpower", "advisor", "auto-pilot"]
+                "leaderboard", "earn hashpower", "advisor", "auto-pilot",
+                "x tasks", "x account", "handle", "tweet"]
+
         options = []
         for btn in page.locator('button').all():
             try:
@@ -151,10 +181,10 @@ def get_next_button(page):
     return None
 
 def answer_question(page, llm_client, question, options):
-    answer_num = ask_llm(llm_client, question, options)
-    log("quiz", f"LLM chose {answer_num}: {options[answer_num-1][:80]}")
+    num = ask_llm(llm_client, question, options)
+    log("quiz", f"LLM chose {num}: {options[num-1][:80]}")
 
-    target = options[answer_num - 1]
+    target = options[num - 1]
     clicked = False
     for btn in page.locator('button').all():
         try:
@@ -166,8 +196,8 @@ def answer_question(page, llm_client, question, options):
         except Exception:
             continue
     if not clicked:
-        page.keyboard.press(str(answer_num))
-        log("quiz", f"⚠️ Pressed key '{answer_num}'")
+        page.keyboard.press(str(num))
+        log("quiz", f"⚠️ Pressed key '{num}'")
 
     random_sleep(2.0, 3.5)
 
@@ -297,7 +327,7 @@ def step2_signin(page, login_key):
     return False
 
 # ============================================================
-#   STEP 3: START MINING (with verification + retry)
+#   STEP 3: START MINING (with modal handling + verification)
 # ============================================================
 def step3_start_mining(page):
     log("3/5", "Starting mining on Rig tab...")
@@ -316,40 +346,60 @@ def step3_start_mining(page):
 
         page.click('button:has-text("Start mining")')
         log("3/5", "Clicked 'Start mining', waiting for modal...")
-        random_sleep(2.0, 4.0)
+        random_sleep(2.0, 3.0)
 
+        modal_handled = False
         try:
-            page.wait_for_selector('text=START MINING', timeout=10000)
-            page.click('button:has-text("Start")', timeout=5000)
-            log("3/5", "✅ Confirmed in modal")
-        except PWTimeout:
-            log("3/5", "⚠️ No modal — mining may auto-start")
-        random_sleep(4.0, 6.0)
+            page.wait_for_selector('[role="dialog"]', timeout=8000)
+            log("3/5", "Modal detected")
+            start_btn = page.locator('[role="dialog"] button:has-text("Start")').first
+            start_btn.click(timeout=5000)
+            log("3/5", "✅ Clicked 'Start' inside modal")
+            modal_handled = True
+            random_sleep(3.0, 5.0)
+        except Exception as e:
+            log("3/5", f"⚠️ Modal handling: {str(e)[:100]}")
+
+        if not modal_handled:
+            try:
+                page.keyboard.press("Enter")
+                log("3/5", "Pressed Enter as fallback")
+                random_sleep(2.0, 3.0)
+            except Exception:
+                pass
+
+        random_sleep(3.0, 5.0)
+
+        # Retry if modal still visible
+        try:
+            if page.locator('[role="dialog"]').first.is_visible(timeout=2000):
+                log("3/5", "⚠️ Modal still visible, clicking any Start button...")
+                for btn in page.locator('[role="dialog"] button').all():
+                    try:
+                        txt = btn.inner_text().strip().lower()
+                        if "start" in txt:
+                            btn.click()
+                            log("3/5", f"✅ Clicked modal button: '{txt}'")
+                            random_sleep(3.0, 5.0)
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
 
         verify = page.inner_text("body").lower()
         if "session on" in verify or ("mining" in verify and "idle" not in verify):
             log("3/5", "🟢 Mining VERIFIED")
             return True
 
-        log("3/5", "⚠️ Retrying mining start...")
-        random_sleep(2.0, 3.0)
-        try:
-            page.click('button:has-text("Start mining")', timeout=5000)
-            random_sleep(2.0, 4.0)
-            try:
-                page.wait_for_selector('text=START MINING', timeout=8000)
-                page.click('button:has-text("Start")', timeout=5000)
-            except PWTimeout:
-                pass
-            random_sleep(3.0, 5.0)
-        except Exception as e:
-            log("3/5", f"⚠️ Retry: {e}")
-
-        final = page.inner_text("body").lower()
-        if "session on" in final or "mining" in final:
-            log("3/5", "🟢 Mining verified on retry")
+        log("3/5", "⚠️ Waiting longer for verification...")
+        random_sleep(5.0, 8.0)
+        verify = page.inner_text("body").lower()
+        if "session on" in verify or "mining" in verify:
+            log("3/5", "🟢 Mining verified after delay")
             return True
-        log("3/5", "❌ Could not start mining")
+
+        log("3/5", "❌ Could not verify mining")
         return False
     except PWTimeout:
         log("3/5", "❌ 'Start mining' button never appeared")
