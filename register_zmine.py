@@ -18,12 +18,13 @@ ACCOUNTS_FILE = "zmine_accounts.jsonl"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_QUESTIONS = 12
 
-# Groq model fallback chain (updated - llama-3.3-70b-versatile is deprecated)
-GROQ_MODELS = [
+# Fallback list (used only if dynamic discovery fails)
+DEFAULT_MODELS = [
+    "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3-32b",
+    "deepseek-r1-distill-llama-70b",
 ]
 
 FIRST_NAMES = [
@@ -60,8 +61,28 @@ def human_type(page, selector, text):
         page.keyboard.type(ch)
         time.sleep(random.uniform(0.05, 0.18))
 
-def ask_llm(client, question, options):
-    """Try multiple Groq models in order. Returns 1-indexed option number."""
+def discover_models(client):
+    """Query Groq API to find which models the API key can access."""
+    try:
+        resp = client.models.list()
+        models = []
+        for m in resp.data:
+            mid = m.id
+            low = mid.lower()
+            # Skip non-chat models
+            if any(skip in low for skip in ["whisper", "tts", "guard", "embed"]):
+                continue
+            models.append(mid)
+        if models:
+            log("llm", f"📋 Discovered {len(models)} models: {models[:8]}")
+            return models
+    except Exception as e:
+        log("llm", f"⚠️ Model discovery failed: {str(e)[:120]}")
+    log("llm", "⚠️ Using fallback model list")
+    return DEFAULT_MODELS
+
+def ask_llm(client, models, question, options):
+    """Try each available model until one answers."""
     prompt = f"""Answer this quiz question. Reply with ONLY the number (1, 2, 3, or 4) of the correct option.
 
 Question: {question}
@@ -70,7 +91,8 @@ Options:
 {chr(10).join(f'{i+1}. {opt}' for i, opt in enumerate(options))}
 
 Answer number:"""
-    for model in GROQ_MODELS:
+
+    for model in models:
         try:
             r = client.chat.completions.create(
                 model=model,
@@ -83,12 +105,14 @@ Answer number:"""
             if m:
                 n = int(m.group(0))
                 if 1 <= n <= len(options):
-                    log("llm", f"✅ {model} chose {n}")
+                    log("llm", f"✅ {model} → option {n}")
                     return n
         except Exception as e:
-            log("llm", f"⚠️ {model} failed: {str(e)[:80]}")
+            err = str(e)[:100]
+            log("llm", f"⚠️ {model} failed: {err}")
             continue
-    log("llm", "❌ All models failed, defaulting to option 1")
+
+    log("llm", "❌ All models failed")
     return 1
 
 def detect_done(page):
@@ -103,24 +127,19 @@ def detect_done(page):
     return False
 
 def parse_question(page):
-    """Extract quiz question + options. Ignores X Tasks section."""
     try:
         body = page.inner_text("body")
-
-        # --- Strip X TASKS section ---
         if "X TASKS" in body:
             body = body.split("X TASKS")[0]
 
         question = None
         lines = [l.strip() for l in body.split("\n") if l.strip()]
 
-        # Strategy 1: line after DIFFICULTY marker
         for i, line in enumerate(lines):
             if "DIFFICULTY" in line and i + 1 < len(lines):
                 question = lines[i + 1]
                 break
 
-        # Strategy 2: substantial line ending with ? or .
         if not question or len(question) < 15:
             for line in lines:
                 if len(line) > 25 and (line.endswith("?") or line.endswith(".")):
@@ -180,8 +199,8 @@ def get_next_button(page):
             continue
     return None
 
-def answer_question(page, llm_client, question, options):
-    num = ask_llm(llm_client, question, options)
+def answer_question(page, llm_client, models, question, options):
+    num = ask_llm(llm_client, models, question, options)
     log("quiz", f"LLM chose {num}: {options[num-1][:80]}")
 
     target = options[num - 1]
@@ -215,7 +234,7 @@ def answer_question(page, llm_client, question, options):
     log("quiz", "⚠️ No Next button found")
     return False
 
-def run_quiz(page, llm_client):
+def run_quiz(page, llm_client, models):
     answered = 0
     for i in range(MAX_QUESTIONS):
         log("quiz", f"--- Question {i+1}/{MAX_QUESTIONS} ---")
@@ -229,7 +248,7 @@ def run_quiz(page, llm_client):
             break
 
         log("quiz", f"Q: {question[:120]}")
-        answer_question(page, llm_client, question, options)
+        answer_question(page, llm_client, models, question, options)
         answered += 1
         random_sleep(1.5, 3.0)
         if detect_done(page):
@@ -327,7 +346,7 @@ def step2_signin(page, login_key):
     return False
 
 # ============================================================
-#   STEP 3: START MINING (with modal handling + verification)
+#   STEP 3: START MINING
 # ============================================================
 def step3_start_mining(page):
     log("3/5", "Starting mining on Rig tab...")
@@ -358,28 +377,25 @@ def step3_start_mining(page):
             modal_handled = True
             random_sleep(3.0, 5.0)
         except Exception as e:
-            log("3/5", f"⚠️ Modal handling: {str(e)[:100]}")
+            log("3/5", f"⚠️ Modal: {str(e)[:80]}")
 
         if not modal_handled:
             try:
                 page.keyboard.press("Enter")
-                log("3/5", "Pressed Enter as fallback")
                 random_sleep(2.0, 3.0)
             except Exception:
                 pass
 
         random_sleep(3.0, 5.0)
 
-        # Retry if modal still visible
         try:
             if page.locator('[role="dialog"]').first.is_visible(timeout=2000):
-                log("3/5", "⚠️ Modal still visible, clicking any Start button...")
                 for btn in page.locator('[role="dialog"] button').all():
                     try:
                         txt = btn.inner_text().strip().lower()
                         if "start" in txt:
                             btn.click()
-                            log("3/5", f"✅ Clicked modal button: '{txt}'")
+                            log("3/5", f"✅ Clicked '{txt}'")
                             random_sleep(3.0, 5.0)
                             break
                     except Exception:
@@ -392,13 +408,11 @@ def step3_start_mining(page):
             log("3/5", "🟢 Mining VERIFIED")
             return True
 
-        log("3/5", "⚠️ Waiting longer for verification...")
         random_sleep(5.0, 8.0)
         verify = page.inner_text("body").lower()
         if "session on" in verify or "mining" in verify:
             log("3/5", "🟢 Mining verified after delay")
             return True
-
         log("3/5", "❌ Could not verify mining")
         return False
     except PWTimeout:
@@ -408,12 +422,11 @@ def step3_start_mining(page):
 # ============================================================
 #   STEP 4: QUIZ
 # ============================================================
-def step4_quiz(page, llm_client):
+def step4_quiz(page, llm_client, models):
     log("4/5", "Navigating to SI quiz...")
     page.goto(SI_URL, wait_until="domcontentloaded", timeout=60000)
     random_sleep(3.0, 5.0)
 
-    # Handle "Start free session" task if present
     try:
         body = page.inner_text("body").lower()
         if "start free session" in body:
@@ -439,7 +452,7 @@ def step4_quiz(page, llm_client):
         log("4/5", "✅ Quiz already done for today")
         return 0
 
-    return run_quiz(page, llm_client)
+    return run_quiz(page, llm_client, models)
 
 # ============================================================
 #   MAIN FLOW
@@ -447,6 +460,11 @@ def step4_quiz(page, llm_client):
 def run_full_flow(llm_client):
     display_name = generate_display_name()
     log("init", f"🚀 Full flow: {display_name}")
+
+    # Discover models BEFORE opening browser
+    models = discover_models(llm_client)
+    if not models:
+        log("init", "⚠️ No LLM models available — will default to option 1")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -469,7 +487,7 @@ def run_full_flow(llm_client):
             mining_ok = step3_start_mining(page)
             if not mining_ok:
                 log("warn", "⚠️ Mining failed, continuing to quiz anyway")
-            questions = step4_quiz(page, llm_client)
+            questions = step4_quiz(page, llm_client, models)
 
             account = {
                 "display_name": display_name,
