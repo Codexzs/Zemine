@@ -6,11 +6,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   farm:
     runs-on: ubuntu-latest
+    name: Renew Mining Sessions
 
     steps:
       - name: Checkout Repository
