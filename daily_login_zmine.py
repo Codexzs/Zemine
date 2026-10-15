@@ -26,7 +26,6 @@ def load_accounts():
     return accounts
 
 def human_type(page, selector, text):
-    """Click the input and type with realistic delays."""
     page.click(selector)
     time.sleep(0.3)
     for ch in text:
@@ -34,12 +33,31 @@ def human_type(page, selector, text):
         time.sleep(random.uniform(0.03, 0.1))
 
 def is_signed_in(page):
-    """Check for signs the user is logged in."""
     try:
         body = page.inner_text("body").lower()
         for signal in ["start mining", "session off", "session on", "mining pool",
-                       "earn hashpower", "idle"]:
+                       "earn hashpower", "idle", "mining"]:
             if signal in body:
+                return True
+    except Exception:
+        pass
+    return False
+
+def is_already_mining(page):
+    """Check if the account is currently mining (session active)."""
+    try:
+        body = page.inner_text("body").lower()
+        # Signs of active mining:
+        # 1. "session on" text
+        # 2. "mining" appears without "start mining"
+        # 3. Time remaining pattern like "23h 52m left"
+        if "session on" in body:
+            return True
+        if "mining" in body and "start mining" not in body:
+            # Extra check: look for time remaining
+            if re.search(r"\d+h\s+\d+m\s+left", body):
+                return True
+            if "mining" in body and "idle" not in body and "session off" not in body:
                 return True
     except Exception:
         pass
@@ -54,13 +72,11 @@ def sign_in(page, login_key):
         log("signin", f"⚠️ Navigation error: {str(e)[:80]}")
         return False
 
-    # Wait for the login input to appear (placeholder contains "LK-")
     log("signin", "Waiting for login key input (placeholder contains 'LK-')...")
     input_selector = 'input[placeholder*="LK-"]'
     try:
         page.wait_for_selector(input_selector, timeout=25000)
     except PWTimeout:
-        # Fallback selectors
         for fallback in ['input[placeholder*="Login key" i]', 'input[name*="key" i]', 'input[type="text"]']:
             try:
                 page.wait_for_selector(fallback, timeout=5000)
@@ -71,21 +87,15 @@ def sign_in(page, login_key):
                 continue
         else:
             log("signin", "❌ Could not find login input")
-            try:
-                log("signin", f"Body: {page.inner_text('body')[:200]}")
-            except Exception:
-                pass
             return False
 
     log("signin", f"✅ Found input: {input_selector}")
     random_sleep(0.5, 1.5)
 
-    # Type the login key
     human_type(page, input_selector, login_key)
     log("signin", "✅ Typed login key")
     random_sleep(0.8, 1.5)
 
-    # Click the "Sign in" button
     clicked = False
     for sel in [
         'button:has-text("Sign in")',
@@ -104,7 +114,6 @@ def sign_in(page, login_key):
             continue
 
     if not clicked:
-        # Fallback: press Enter
         try:
             page.keyboard.press("Enter")
             log("signin", "⚠️ Pressed Enter as fallback")
@@ -112,7 +121,6 @@ def sign_in(page, login_key):
             log("signin", "❌ Could not submit login form")
             return False
 
-    # Wait for redirect to /app
     log("signin", "Waiting for redirect to /app...")
     try:
         page.wait_for_url("**/app**", timeout=20000)
@@ -121,18 +129,17 @@ def sign_in(page, login_key):
         log("signin", "⚠️ No redirect detected, waiting anyway...")
         random_sleep(3.0, 5.0)
 
-    # Final check
     random_sleep(2.0, 3.0)
     if is_signed_in(page):
         log("signin", "✅ Signed in successfully")
         return True
 
-    log("signin", "⚠️ Could not confirm sign-in, but continuing anyway")
-    return True  # Continue to try mining anyway
+    log("signin", "⚠️ Could not confirm sign-in, but continuing")
+    return True
 
 def start_mining(page):
-    """Click Start mining and confirm in modal."""
-    log("mine", "Waiting for Rig page...")
+    """Click Start mining if session is off. Returns True if mining is active."""
+    log("mine", "Checking mining state...")
     random_sleep(2.0, 3.5)
 
     # If not on /app, navigate there
@@ -141,23 +148,23 @@ def start_mining(page):
             page.goto(APP_URL, wait_until="domcontentloaded", timeout=60000)
             random_sleep(3.0, 4.5)
         except Exception as e:
-            log("mine", f"⚠️ Could not navigate to /app: {str(e)[:80]}")
+            log("mine", f"⚠️ Navigation: {str(e)[:80]}")
 
-    # Check if already mining
-    try:
-        body = page.inner_text("body").lower()
-        if "session on" in body:
-            log("mine", "✅ Already mining (session on)")
-            return True
-    except Exception:
-        pass
+    # --- KEY FIX: Check if ALREADY mining ---
+    if is_already_mining(page):
+        log("mine", "✅ Already mining (session active) — skipping Start click")
+        return True
 
-    # Wait for the Start mining button
-    log("mine", "Waiting for 'Start mining' button...")
+    # Wait for the Start mining button (only appears when session is off)
+    log("mine", "Session is off — waiting for 'Start mining' button...")
     try:
-        page.wait_for_selector('button:has-text("Start mining")', timeout=25000)
+        page.wait_for_selector('button:has-text("Start mining")', timeout=15000)
     except PWTimeout:
-        log("mine", "❌ 'Start mining' button never appeared")
+        # Re-check if it flipped to mining while we were waiting
+        if is_already_mining(page):
+            log("mine", "✅ Session became active during wait")
+            return True
+        log("mine", "❌ 'Start mining' button never appeared and not mining")
         try:
             log("mine", f"URL: {page.url}")
             log("mine", f"Body: {page.inner_text('body')[:300].replace(chr(10), ' | ')}")
@@ -171,17 +178,18 @@ def start_mining(page):
     log("mine", "Clicked 'Start mining'")
     random_sleep(2.0, 3.0)
 
-    # Handle the START MINING modal (screenshot shows: Hashpower, Duration, Cost, Cancel, Start)
+    # Handle confirmation modal
     log("mine", "Waiting for confirmation modal...")
+    modal_found = False
     try:
         page.wait_for_selector('text="START MINING"', timeout=8000)
         log("mine", "✅ Modal detected")
+        modal_found = True
     except PWTimeout:
-        log("mine", "⚠️ Modal text not found, looking for Start button anyway...")
+        log("mine", "⚠️ Modal text not found, will try Start button anyway")
 
-    # Click "Start" button (the modal's confirm button)
+    # Click the modal's Start button
     start_clicked = False
-    # Try multiple selectors for the modal's Start button
     for sel in [
         '[role="dialog"] button:has-text("Start")',
         'div:has-text("START MINING") button:has-text("Start")',
@@ -204,22 +212,14 @@ def start_mining(page):
     random_sleep(4.0, 6.0)
 
     # Verify
-    try:
-        verify = page.inner_text("body").lower()
-        if "session on" in verify or ("mining" in verify and "idle" not in verify):
-            log("mine", "🟢 Mining VERIFIED (session is now ON)")
-            return True
-    except Exception:
-        pass
+    if is_already_mining(page):
+        log("mine", "🟢 Mining VERIFIED (session is now ON)")
+        return True
 
     random_sleep(5.0, 8.0)
-    try:
-        verify = page.inner_text("body").lower()
-        if "session on" in verify or "mining" in verify:
-            log("mine", "🟢 Mining verified after delay")
-            return True
-    except Exception:
-        pass
+    if is_already_mining(page):
+        log("mine", "🟢 Mining verified after delay")
+        return True
 
     log("mine", "⚠️ Could not verify mining status, but Start was clicked")
     return True
