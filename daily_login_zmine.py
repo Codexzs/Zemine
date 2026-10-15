@@ -1,7 +1,6 @@
 import time
 import random
 import json
-import subprocess
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ============================================================
@@ -10,7 +9,12 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 ACCOUNTS_FILE = "zmine_accounts.jsonl"
 APP_URL = "https://zmine.si/app"
 HOME_URL = "https://zmine.si/"
-SI_URL = "https://zmine.si/app/si"
+LOGIN_URLS = [
+    "https://zmine.si/app",
+    "https://zmine.si/",
+    "https://zmine.si/login",
+    "https://zmine.si/app/login",
+]
 
 def log(step, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{step}] {msg}", flush=True)
@@ -31,45 +35,77 @@ def human_type(page, selector, text):
     page.click(selector)
     for ch in text:
         page.keyboard.type(ch)
-        time.sleep(random.uniform(0.05, 0.15))
+        time.sleep(random.uniform(0.04, 0.12))
 
-def wait_for_page_ready(page, timeout=30000):
-    """Wait for the Next.js app to finish rendering."""
+def wait_network_idle(page, timeout=15000):
+    """Wait for network to be mostly idle (Next.js hydration done)."""
     try:
-        # Wait for at least one interactive element to appear
-        page.wait_for_function(
-            """() => {
-                const buttons = document.querySelectorAll('button, a, input');
-                return buttons.length > 3;
-            }""",
-            timeout=timeout
-        )
+        page.wait_for_load_state("networkidle", timeout=timeout)
         return True
     except PWTimeout:
         return False
 
 def is_signed_in(page):
-    """Check if the page shows a logged-in state (Rig, Start mining, etc.)."""
+    """Check for signs the user is logged in."""
     try:
         body = page.inner_text("body").lower()
-        if "start mining" in body or "session off" in body or "session on" in body:
-            return True
-        if "earn hashpower" in body or "mining pool" in body:
-            return True
+        for signal in ["start mining", "session off", "session on",
+                       "earn hashpower", "mining pool", "rig is optimal",
+                       "auto-pilot", "my sst"]:
+            if signal in body:
+                return True
     except Exception:
         pass
     return False
 
-def click_log_in_link(page):
-    """Find and click a 'Log in' link on the welcome/home page."""
+def dump_debug(page, label):
+    """Dump URL and visible text on failure."""
+    try:
+        log("debug", f"--- {label} ---")
+        log("debug", f"URL: {page.url}")
+        body = page.inner_text("body")
+        log("debug", f"Body preview: {body[:300].replace(chr(10), ' | ')}")
+    except Exception:
+        pass
+
+def find_login_input(page):
+    """Find any element that looks like a login key input."""
     selectors = [
-        'text="Log in"',
-        'text="Sign in"',
-        'text="Login"',
+        'textarea[placeholder*="login" i]',
+        'textarea[placeholder*="key" i]',
+        'textarea[placeholder*="identity" i]',
+        'input[placeholder*="login" i]',
+        'input[placeholder*="key" i]',
+        'input[placeholder*="identity" i]',
+        'input[name="loginKey"]',
+        'input[name="key"]',
+        'input[name="identity"]',
+        'textarea',
+        'input[type="text"]',
+        '[contenteditable="true"]',
+    ]
+    for sel in selectors:
+        try:
+            inp = page.locator(sel).first
+            if inp.is_visible(timeout=1500):
+                return inp, sel
+        except Exception:
+            continue
+    return None, None
+
+def click_signin_link(page):
+    """Try multiple selectors to find a clickable sign-in trigger."""
+    selectors = [
         'a:has-text("Log in")',
         'a:has-text("Sign in")',
+        'a:has-text("Login")',
         'button:has-text("Log in")',
         'button:has-text("Sign in")',
+        'button:has-text("Login")',
+        'text="Log in"',
+        'text="Sign in"',
+        '[href*="login"]',
+        '[href*="signin"]',
     ]
     for sel in selectors:
         try:
@@ -82,102 +118,91 @@ def click_log_in_link(page):
             continue
     return False
 
-def find_login_input(page):
-    """Find the identity/login key input field."""
-    selectors = [
-        'input[placeholder*="login" i]',
-        'input[placeholder*="key" i]',
-        'input[placeholder*="identity" i]',
-        'input[name="loginKey"]',
-        'input[name="key"]',
-        'input[name="identity"]',
-        'input[type="text"]',
-    ]
-    for sel in selectors:
-        try:
-            inp = page.locator(sel).first
-            if inp.is_visible(timeout=2000):
-                return inp, sel
-        except Exception:
-            continue
-    return None, None
+def attempt_signin_from_url(page, login_key):
+    """Try signing in from whatever URL we're currently on."""
+    log("signin", f"Waiting for page render at {page.url}...")
+    wait_network_idle(page, timeout=12000)
+    random_sleep(2.5, 4.0)
 
-def sign_in(page, login_key):
-    """Robust sign-in flow for the Next.js SPA."""
-    log("signin", "Navigating to app...")
-    page.goto(APP_URL, wait_until="domcontentloaded", timeout=60000)
-    random_sleep(3.0, 5.0)
-
-    log("signin", "Waiting for page to fully render...")
-    if not wait_for_page_ready(page, timeout=30000):
-        log("signin", "⚠️ Page did not render in 30s")
-
-    # Check if already signed in
-    random_sleep(2.0, 3.0)
+    # Already signed in?
     if is_signed_in(page):
         log("signin", "✅ Already signed in")
         return True
 
     # Try clicking a Log in link
-    log("signin", "Looking for Log in link...")
-    if not click_log_in_link(page):
-        log("signin", "No Log in link found — checking if login form is already present...")
-    else:
-        random_sleep(2.0, 3.5)
-        wait_for_page_ready(page, timeout=15000)
+    if click_signin_link(page):
+        log("signin", "Waiting for login form after click...")
+        wait_network_idle(page, timeout=10000)
+        random_sleep(3.0, 5.0)
 
-    # Now look for the input field
-    log("signin", "Looking for login key input...")
-    inp, sel = find_login_input(page)
-    if not inp:
-        # Last resort: navigate to homepage and try again
-        log("signin", "⚠️ No input found on /app, trying homepage...")
-        page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
-        random_sleep(3.0, 4.0)
-        wait_for_page_ready(page, timeout=15000)
-        if not click_log_in_link(page):
-            log("signin", "❌ Could not find Log in link on homepage")
-            return False
-        random_sleep(2.0, 3.5)
-        wait_for_page_ready(page, timeout=15000)
+    # Try to find the input with retries
+    for attempt in range(4):
         inp, sel = find_login_input(page)
-        if not inp:
-            log("signin", "❌ Could not find login key input")
-            return False
+        if inp:
+            log("signin", f"✅ Found input via '{sel}' (attempt {attempt+1})")
+            try:
+                inp.click()
+                random_sleep(0.5, 1.0)
+                for ch in login_key:
+                    page.keyboard.type(ch)
+                    time.sleep(random.uniform(0.04, 0.12))
+                random_sleep(0.8, 1.5)
 
-    log("signin", f"✅ Found input via '{sel}'")
-    inp.click()
-    human_type(page, sel, login_key)
-    random_sleep(0.5, 1.5)
+                # Try clicking the submit button
+                for btn_text in ["Log in", "Sign in", "Login", "Continue", "Confirm", "Submit"]:
+                    try:
+                        page.click(f'button:has-text("{btn_text}")', timeout=2000)
+                        log("signin", f"✅ Clicked '{btn_text}' button")
+                        random_sleep(5.0, 7.0)
+                        return True
+                    except Exception:
+                        continue
 
-    # Click the Log in / Sign in / Confirm button
-    for btn_text in ["Log in", "Sign in", "Login", "Continue", "Confirm"]:
+                # Fallback: Enter key
+                page.keyboard.press("Enter")
+                log("signin", "⚠️ Pressed Enter as fallback")
+                random_sleep(5.0, 7.0)
+                return True
+            except Exception as e:
+                log("signin", f"⚠️ Input interaction error: {str(e)[:100]}")
+
+        log("signin", f"⚠️ Attempt {attempt+1}/4: input not found, waiting...")
+        wait_network_idle(page, timeout=5000)
+        random_sleep(3.0, 4.5)
+
+    return False
+
+def sign_in(page, login_key):
+    """Robust sign-in: tries multiple URLs."""
+    for url in LOGIN_URLS:
+        log("signin", f"Trying {url}...")
         try:
-            page.click(f'button:has-text("{btn_text}")', timeout=2500)
-            log("signin", f"✅ Clicked '{btn_text}' button")
-            random_sleep(4.0, 6.0)
-            return True
-        except Exception:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            log("signin", f"⚠️ Navigation error: {str(e)[:80]}")
             continue
 
-    # Fallback: press Enter
-    try:
-        page.keyboard.press("Enter")
-        log("signin", "⚠️ Pressed Enter as fallback")
-        random_sleep(4.0, 6.0)
-        return True
-    except Exception:
-        pass
+        random_sleep(3.0, 5.0)
 
-    log("signin", "❌ Could not click any sign-in button")
+        if attempt_signin_from_url(page, login_key):
+            return True
+
+        log("signin", f"❌ Failed on {url}, trying next URL...")
+
+    log("signin", "❌ All sign-in attempts failed")
+    dump_debug(page, "Final state")
     return False
 
 def start_mining(page):
     log("mine", "Waiting for Rig page...")
+    wait_network_idle(page, timeout=10000)
+    random_sleep(2.0, 3.5)
+
     try:
         page.wait_for_selector('button:has-text("Start mining")', timeout=25000)
     except PWTimeout:
         log("mine", "❌ 'Start mining' button never appeared")
+        dump_debug(page, "Start mining failure")
         return False
 
     body = page.inner_text("body").lower()
@@ -189,7 +214,6 @@ def start_mining(page):
     page.click('button:has-text("Start mining")')
     random_sleep(2.0, 4.0)
 
-    # Handle modal
     modal_handled = False
     try:
         page.wait_for_selector('[role="dialog"]', timeout=8000)
@@ -211,7 +235,6 @@ def start_mining(page):
 
     random_sleep(3.0, 5.0)
 
-    # Verify
     verify = page.inner_text("body").lower()
     if "session on" in verify or ("mining" in verify and "idle" not in verify):
         log("mine", "🟢 Mining VERIFIED")
@@ -243,9 +266,14 @@ def farm_account(browser, account):
     try:
         signed_in = sign_in(page, login_key)
         if not signed_in:
-            log("farm", f"❌ Could not sign in for {display_name}")
+            log("farm", f"❌ Sign-in failed for {display_name}")
             return
-        random_sleep(3.0, 5.0)
+
+        # Navigate to Rig/app if we aren't there
+        if "/app" not in page.url:
+            page.goto(APP_URL, wait_until="domcontentloaded", timeout=60000)
+            random_sleep(3.0, 4.5)
+
         start_mining(page)
     except Exception as e:
         log("farm", f"❌ {display_name}: {e}")
