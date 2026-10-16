@@ -16,6 +16,29 @@ SI_URL = "https://zmine.si/app/si"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_QUESTIONS = 12
 
+# --- Anti-detection randomization pools ---
+USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 13; CPH2451) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; 22101316G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36",
+]
+VIEWPORTS = [
+    {"width": 412, "height": 915},   # Pixel 7
+    {"width": 412, "height": 917},   # Pixel 8
+    {"width": 360, "height": 800},   # Galaxy S23
+    {"width": 390, "height": 844},   # iPhone 14
+    {"width": 393, "height": 851},   # Xiaomi
+    {"width": 412, "height": 915},   # OnePlus
+    {"width": 375, "height": 812},   # iPhone X
+]
+LOCALES = ["en-US", "en-GB", "en-CA", "en-AU"]
+TIMEZONES = ["America/New_York", "Europe/London", "Asia/Kolkata", "America/Chicago", "Europe/Berlin"]
+
 # ============================================================
 #   HELPERS
 # ============================================================
@@ -100,7 +123,7 @@ Then, provide your final answer by writing ONLY the correct option number inside
     return 1
 
 # ============================================================
-#   ROBUST SIGN-IN (same as daily_login_zmine.py)
+#   SIGN-IN
 # ============================================================
 def is_signed_in(page):
     try:
@@ -114,7 +137,6 @@ def is_signed_in(page):
     return False
 
 def sign_in(page, login_key):
-    """Sign in via the dedicated /login URL."""
     log("signin", f"Navigating to {LOGIN_URL}")
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
@@ -348,14 +370,21 @@ def answer_question(page, llm_client, models, question, options):
         page.keyboard.press(str(num))
         log("quiz", f"⚠️ Pressed key '{num}'")
 
-    random_sleep(3.0, 4.5)
+    # --- Randomization: longer wait for feedback + occasional longer pause ---
+    random_sleep(3.0, 5.0)
+
+    # 30% chance of a longer "reading" pause between questions
+    if random.random() < 0.3:
+        log("quiz", "   (longer reading pause)")
+        random_sleep(6.0, 12.0)
+
     for _ in range(15):
         nb = get_next_button(page)
         if nb:
             try:
                 nb.click()
                 log("quiz", "✅ Clicked Next")
-                random_sleep(3.5, 5.0)
+                random_sleep(3.5, 6.0)  # was 3.5-5.0
                 return True
             except Exception:
                 pass
@@ -406,30 +435,36 @@ def run_quiz(page, llm_client, models):
         log("quiz", f"Q: {question[:120]}")
         answer_question(page, llm_client, models, question, options)
         answered += 1
-        random_sleep(2.0, 3.5)
+        random_sleep(2.5, 5.0)  # was 2.0-3.5
         if detect_done(page):
             break
     log("quiz", f"✅ Finished: {answered} questions")
     return answered
 
 def run_for_account(llm_client, models, account):
-    log("account", f"📚 {account['display_name']}")
+    display_name = account["display_name"]
+    log("account", f"📚 {display_name}")
+
+    # --- Randomize fingerprint per account ---
+    ua = random.choice(USER_AGENTS)
+    vp = random.choice(VIEWPORTS)
+    locale = random.choice(LOCALES)
+    tz = random.choice(TIMEZONES)
+    log("account", f"   Fingerprint: {vp['width']}x{vp['height']} | {locale} | {tz} | {ua[:50]}...")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
         )
         context = browser.new_context(
-            viewport={"width": 412, "height": 915},
-            user_agent=(
-                "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Mobile Safari/537.36"
-            ),
+            viewport=vp,
+            user_agent=ua,
+            locale=locale,
+            timezone_id=tz,
         )
         page = context.new_page()
         try:
-            # --- KEY FIX: Sign in FIRST via /login ---
             signed_in = sign_in(page, account["login_key"])
             if not signed_in:
                 log("account", "❌ Could not sign in")
@@ -437,12 +472,10 @@ def run_for_account(llm_client, models, account):
 
             random_sleep(2.0, 4.0)
 
-            # Now navigate to the SI quiz page (authenticated session)
             log("account", "Navigating to SI quiz page...")
             page.goto(SI_URL, wait_until="domcontentloaded", timeout=60000)
             random_sleep(3.0, 5.0)
 
-            # Verify we're actually on the SI page, not redirected to login
             if "/login" in page.url:
                 log("account", "❌ Redirected to login — auth failed")
                 return 0
@@ -483,12 +516,31 @@ def main():
     llm = Groq(api_key=GROQ_API_KEY)
     models = discover_models(llm)
     accounts = load_accounts()
+
+    if not accounts:
+        log("init", "No accounts found.")
+        return
+
+    # Shuffle first
     random.shuffle(accounts)
+
+    # --- Randomization: sample only 90% of accounts per run (if >10 accounts) ---
+    if len(accounts) > 10:
+        sample_size = int(len(accounts) * 0.9)
+        accounts = accounts[:sample_size]
+        log("init", f"Sampled {sample_size}/{len(accounts)} accounts (90% randomized)")
+
     total = 0
     for idx, acc in enumerate(accounts, 1):
         log("main", f"=== {idx}/{len(accounts)}: {acc['display_name']} ===")
         total += run_for_account(llm, models, acc)
-        random_sleep(10.0, 20.0)
+
+        # --- Randomization: longer inter-account delay ---
+        if idx < len(accounts):
+            gap = random.uniform(30.0, 90.0)
+            log("main", f"   Waiting {gap:.0f}s before next account...")
+            time.sleep(gap)
+
     log("done", f"✅ Total answered: {total}")
 
 if __name__ == "__main__":
