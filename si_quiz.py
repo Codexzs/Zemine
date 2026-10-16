@@ -6,11 +6,19 @@ import re
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from groq import Groq
 
+# ============================================================
+#   CONFIGURATION
+# ============================================================
 ACCOUNTS_FILE = "zmine_accounts.jsonl"
+LOGIN_URL = "https://zmine.si/login"
+APP_URL = "https://zmine.si/app"
 SI_URL = "https://zmine.si/app/si"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MAX_QUESTIONS = 12
 
+# ============================================================
+#   HELPERS
+# ============================================================
 def log(step, msg):
     print(f"[{time.strftime('%H:%M:%S')}] [{step}] {msg}", flush=True)
 
@@ -25,6 +33,13 @@ def load_accounts():
             if line:
                 accounts.append(json.loads(line))
     return accounts
+
+def human_type(page, selector, text):
+    page.click(selector)
+    time.sleep(0.3)
+    for ch in text:
+        page.keyboard.type(ch)
+        time.sleep(random.uniform(0.03, 0.1))
 
 def discover_models(client):
     try:
@@ -50,7 +65,6 @@ def discover_models(client):
         return ["qwen/qwen3.8-27b", "allam-2-7b"]
 
 def ask_llm(client, models, question, options):
-    """Chain-of-thought prompt. Extract bracketed answer first."""
     prompt = f"""Question: {question}
 
 Options:
@@ -58,7 +72,6 @@ Options:
 
 First, think step-by-step to calculate or determine the correct answer.
 Then, provide your final answer by writing ONLY the correct option number inside brackets at the very end, like [1], [2], [3], or [4]."""
-
     for model in models:
         try:
             r = client.chat.completions.create(
@@ -69,13 +82,11 @@ Then, provide your final answer by writing ONLY the correct option number inside
             )
             raw = r.choices[0].message.content.strip()
             log("llm", f"   {model} reasoning end: {raw[-100:]}")
-
             matches = re.findall(r"\[([1-4])\]", raw)
             if matches:
                 n = int(matches[-1])
                 log("llm", f"✅ {model} → option {n}")
                 return n
-
             matches = re.findall(r"\d+", raw)
             for candidate in reversed(matches):
                 n = int(candidate)
@@ -88,33 +99,97 @@ Then, provide your final answer by writing ONLY the correct option number inside
     log("llm", "❌ All models failed, defaulting to option 1")
     return 1
 
-def sign_in(page, login_key):
-    random_sleep(2.0, 3.0)
-    body = page.inner_text("body")
-    if "TASKS" in body and ("DIFFICULTY" in body or "Done for today" in body):
-        return True
-    for sel in ['input[placeholder*="login" i]', 'input[placeholder*="key" i]',
-                'input[name="loginKey"]', 'input[type="text"]']:
-        try:
-            inp = page.locator(sel).first
-            inp.wait_for(state="visible", timeout=3000)
-            inp.click()
-            for ch in login_key:
-                page.keyboard.type(ch)
-                time.sleep(random.uniform(0.05, 0.15))
-            random_sleep(0.5, 1.5)
-            for btn in ["Sign in", "Log in", "Login", "Continue"]:
-                try:
-                    page.click(f'button:has-text("{btn}")', timeout=2000)
-                    log("signin", "✅ Signed in")
-                    random_sleep(4.0, 6.0)
-                    return True
-                except PWTimeout:
-                    continue
-        except PWTimeout:
-            continue
+# ============================================================
+#   ROBUST SIGN-IN (same as daily_login_zmine.py)
+# ============================================================
+def is_signed_in(page):
+    try:
+        body = page.inner_text("body").lower()
+        for signal in ["start mining", "session off", "session on", "mining pool",
+                       "earn hashpower", "idle", "mining"]:
+            if signal in body:
+                return True
+    except Exception:
+        pass
     return False
 
+def sign_in(page, login_key):
+    """Sign in via the dedicated /login URL."""
+    log("signin", f"Navigating to {LOGIN_URL}")
+    try:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    except Exception as e:
+        log("signin", f"⚠️ Navigation error: {str(e)[:80]}")
+        return False
+
+    log("signin", "Waiting for login key input (placeholder contains 'LK-')...")
+    input_selector = 'input[placeholder*="LK-"]'
+    try:
+        page.wait_for_selector(input_selector, timeout=25000)
+    except PWTimeout:
+        for fallback in ['input[placeholder*="Login key" i]', 'input[name*="key" i]', 'input[type="text"]']:
+            try:
+                page.wait_for_selector(fallback, timeout=5000)
+                input_selector = fallback
+                log("signin", f"✅ Using fallback selector: {fallback}")
+                break
+            except PWTimeout:
+                continue
+        else:
+            log("signin", "❌ Could not find login input")
+            return False
+
+    log("signin", f"✅ Found input: {input_selector}")
+    random_sleep(0.5, 1.5)
+
+    human_type(page, input_selector, login_key)
+    log("signin", "✅ Typed login key")
+    random_sleep(0.8, 1.5)
+
+    clicked = False
+    for sel in [
+        'button:has-text("Sign in")',
+        'button:has-text("Sign In")',
+        'button[type="submit"]',
+        'button:has-text("Log in")',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=2000):
+                btn.click()
+                log("signin", f"✅ Clicked '{sel}'")
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        try:
+            page.keyboard.press("Enter")
+            log("signin", "⚠️ Pressed Enter as fallback")
+        except Exception:
+            log("signin", "❌ Could not submit login form")
+            return False
+
+    log("signin", "Waiting for redirect to /app...")
+    try:
+        page.wait_for_url("**/app**", timeout=20000)
+        log("signin", "✅ Redirected to /app")
+    except PWTimeout:
+        log("signin", "⚠️ No redirect detected, waiting anyway...")
+        random_sleep(3.0, 5.0)
+
+    random_sleep(2.0, 3.0)
+    if is_signed_in(page):
+        log("signin", "✅ Signed in successfully")
+        return True
+
+    log("signin", "⚠️ Could not confirm sign-in, but continuing")
+    return True
+
+# ============================================================
+#   QUIZ LOGIC
+# ============================================================
 def detect_done(page):
     try:
         body = page.inner_text("body")
@@ -219,7 +294,6 @@ def parse_question(page):
                 seen.add(o)
                 unique.append(o)
 
-        # Fallback: scrape options from text lines
         if len(unique) < 2 and q_idx != -1:
             extracted = []
             for k in range(q_idx + 1, min(q_idx + 15, len(lines))):
@@ -251,7 +325,7 @@ def get_next_button(page):
 
 def answer_question(page, llm_client, models, question, options):
     num = ask_llm(llm_client, models, question, options)
-    log("quiz", f"LLM chose {num}: {options[num-1][:80]}")
+    log("quiz", f"LLM chose {num}: {options[num-1][:80].replace(chr(10), ' | ')}")
     target = options[num - 1]
     clicked = False
     for btn in page.locator('button').all():
@@ -355,16 +429,46 @@ def run_for_account(llm_client, models, account):
         )
         page = context.new_page()
         try:
+            # --- KEY FIX: Sign in FIRST via /login ---
+            signed_in = sign_in(page, account["login_key"])
+            if not signed_in:
+                log("account", "❌ Could not sign in")
+                return 0
+
+            random_sleep(2.0, 4.0)
+
+            # Now navigate to the SI quiz page (authenticated session)
+            log("account", "Navigating to SI quiz page...")
             page.goto(SI_URL, wait_until="domcontentloaded", timeout=60000)
-            random_sleep(2.0, 4.0)
-            sign_in(page, account["login_key"])
-            random_sleep(2.0, 4.0)
-            if "/si" not in page.url:
-                page.goto(SI_URL, wait_until="domcontentloaded", timeout=60000)
-                random_sleep(2.0, 4.0)
+            random_sleep(3.0, 5.0)
+
+            # Verify we're actually on the SI page, not redirected to login
+            if "/login" in page.url:
+                log("account", "❌ Redirected to login — auth failed")
+                return 0
+
+            # Handle "Start free session" if it appears
+            try:
+                body = page.inner_text("body").lower()
+                if "start free session" in body:
+                    try:
+                        page.click('text=Start free session', timeout=3000)
+                        log("account", "Clicked 'Start free session'")
+                        random_sleep(2.0, 4.0)
+                        try:
+                            page.click('button:has-text("Start")', timeout=3000)
+                            random_sleep(2.0, 3.0)
+                        except PWTimeout:
+                            pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             if detect_done(page):
                 log("account", "Already done for today")
                 return 0
+
             return run_quiz(page, llm_client, models)
         except Exception as e:
             log("account", f"❌ {e}")
